@@ -22,7 +22,8 @@ BasicTimer::~BasicTimer() {
     m_callback_thread_cv.notify_one();
 
     if (m_timing_thread.joinable()) {
-        if (std::this_thread::get_id() != m_timing_thread.get_id()) { //thread can not join itself
+        //thread can not join itself
+        if (std::this_thread::get_id() != m_timing_thread.get_id()) {
             m_timing_thread.join();
         } else {
             m_timing_thread.detach(); // last resort if self
@@ -44,7 +45,7 @@ void BasicTimer::stop() {
 
         if (!m_timing_thread_running.load()) {
             std::cout << "BasicTimer::stop(): warn: timer already stopped!\n";
-            return;
+            goto CLEAR_QUEUE;
         }
 
         m_timing_thread_request_stop.store(true);
@@ -52,9 +53,13 @@ void BasicTimer::stop() {
     m_timing_thread_cv.notify_one(); {
         std::unique_lock lk(m_timing_thread_mutex);
         m_timing_thread_cv.wait(lk, [this] { return !m_timing_thread_running.load(); });
-    } {
+    }
+
+CLEAR_QUEUE: {
         std::scoped_lock lk(m_callback_thread_mutex);
-        m_callback_queue = std::queue<CallBack>();
+        if (!m_callback_queue.empty()) {
+            m_callback_queue = std::queue<CallBack>();
+        }
     }
 }
 
@@ -162,9 +167,7 @@ void BasicTimer::timing_thread() {
             std::scoped_lock lk(m_timing_thread_mutex);
             m_timing_thread_running.store(false);
         }
-        m_timing_thread_cv.notify_one();
-
-        {
+        m_timing_thread_cv.notify_one(); {
             std::unique_lock lk(m_timing_thread_mutex);
             m_timing_thread_cv.wait(lk, [this] {
                 return m_timing_thread_request_start.load() || m_request_all_threads_exit.load();
