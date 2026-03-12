@@ -16,120 +16,119 @@ BasicTimer::BasicTimer() {
 }
 
 BasicTimer::~BasicTimer() {
-    m_request_all_threads_exit.store(true);
+    std::scoped_lock lk(m_api_mutex);
 
-    m_timing_thread_cv.notify_one();
-    m_callback_thread_cv.notify_one();
+    stop_internal();
 
-    if (m_timing_thread.joinable()) {
-        //thread can not join itself
-        if (std::this_thread::get_id() != m_timing_thread.get_id()) {
-            m_timing_thread.join();
-        } else {
-            m_timing_thread.detach(); // last resort if self
-        }
+    {
+        std::scoped_lock llk(m_state_mutex, m_callback_queue_mutex);
+
+        m_destructing = true;
+        m_timing_thread_cv.notify_one();
+        m_callback_thread_cv.notify_one();
     }
 
-    if (m_callback_thread.joinable()) {
-        if (std::this_thread::get_id() != m_callback_thread.get_id()) {
-            m_callback_thread.join();
-        } else {
-            m_callback_thread.detach(); // last resort if self
-        }
-    }
+    join(m_timing_thread);
+    join(m_callback_thread);
 }
 
 void BasicTimer::stop() {
-    std::scoped_lock api_lk(m_api_mutex); {
-        std::scoped_lock lk(m_timing_thread_mutex);
+    std::scoped_lock lk(m_api_mutex);
 
-        if (!m_timing_thread_running.load()) {
-            std::cout << "BasicTimer::stop(): warn: timer already stopped!\n";
-            goto CLEAR_QUEUE;
-        }
+    stop_internal();
+}
 
-        m_timing_thread_request_stop.store(true);
-    }
-    m_timing_thread_cv.notify_one(); {
-        std::unique_lock lk(m_timing_thread_mutex);
-        m_timing_thread_cv.wait(lk, [this] { return !m_timing_thread_running.load(); });
+void BasicTimer::stop_internal() {
+    std::unique_lock lk(m_state_mutex);
+
+    if (m_state == Stopped) {
+        std::cout <<  "already stopped!\n";
+        goto END; // ensure callback queue is cleared
     }
 
-CLEAR_QUEUE: {
-        std::scoped_lock lk(m_callback_thread_mutex);
-        if (!m_callback_queue.empty()) {
-            m_callback_queue = std::queue<CallBack>();
-        }
-    }
+    m_state = Stopping;
+    m_timing_thread_cv.notify_one();
+
+    m_api_cv.wait(lk, [this] { // internal unlocked
+        return m_state == Stopped;
+    });
+
+END:
+    std::scoped_lock llk(m_callback_queue_mutex);
+    std::queue<CallBack>().swap(m_callback_queue);
 }
 
 void BasicTimer::start() {
-    std::scoped_lock api_lk(m_api_mutex); {
-        if (m_loop_times.load() == 0 || m_timeout_milliseconds.load() == 0) {
-            std::cout << "BasicTimer::start(): error: loop times or timeout(milliseconds) is invalid!\n";
-            return;
-        }
+    std::scoped_lock lk(m_api_mutex);
+    std::unique_lock lk2(m_state_mutex);
 
-        std::scoped_lock lk(m_timing_thread_mutex);
-
-        if (m_timing_thread_running.load()) {
-            std::cout << "BasicTimer::start(): warn: timer already started!\n";
-            return;
-        }
-
-        m_timing_thread_request_start.store(true);
+    if (m_loop_times == 0 || m_timeout_milliseconds == 0) {
+        std::cerr << "start failed: invalid loop times or timeout(milliseconds)!\n";
+        return;
     }
+
+    if (m_state == Started) {
+        std::cout << "already running!\n";
+        return;
+    }
+
+    m_state = Starting;
     m_timing_thread_cv.notify_one();
 
-    std::unique_lock lk(m_timing_thread_mutex);
-    m_timing_thread_cv.wait(lk, [this] { return m_timing_thread_running.load(); });
+    m_api_cv.wait(lk2, [this] { // internal unlocked
+        return m_state == Started;
+    });
 }
 
 bool BasicTimer::running() {
     std::scoped_lock lk(m_api_mutex);
+    std::scoped_lock lk2(m_state_mutex);
 
-    return m_timing_thread_running.load();
+    return m_state == Started;
 }
 
 bool BasicTimer::set_timeout(std::uint32_t milliseconds) {
+    std::scoped_lock lk(m_api_mutex);
+    std::scoped_lock lk2(m_state_mutex);
+
     if (milliseconds == 0) {
-        std::cout << "BasicTimer::set_timeout(): error: can't set timeout to 0 milliseconds!\n";
+        std::cerr << "can't set timeout to 0 milliseconds!\n";
         return false;
     }
 
-    std::scoped_lock lk(m_api_mutex, m_timing_thread_mutex);
-
-    if (m_timing_thread_running.load()) {
-        std::cout << "BasicTimer::set_timeout(): error: can't set timeout when timer is running!\n";
+    if (m_state == Started) {
+        std::cerr << "can't set timeout when timer is running!\n";
         return false;
     }
 
-    m_timeout_milliseconds.store(milliseconds);
+    m_timeout_milliseconds = milliseconds;
     return true;
 }
 
 bool BasicTimer::set_loop_times(std::uint32_t times) {
+    std::scoped_lock lk(m_api_mutex);
+    std::scoped_lock lk2(m_state_mutex);
+
     if (times == 0) {
-        std::cout << "BasicTimer::set_loop_times(): error: can't set loop times to 0!\n";
+        std::cerr << "can't set loop times to 0!\n";
         return false;
     }
 
-    std::scoped_lock lk(m_api_mutex, m_timing_thread_mutex);
-
-    if (m_timing_thread_running.load()) {
-        std::cout << "BasicTimer::set_loop_times(): error: can't set loop times when timer is running!\n";
+    if (m_state == Started) {
+        std::cerr << "can't set loop times when timer is running!\n";;
         return false;
     }
 
-    m_loop_times.store(times);
+    m_loop_times = times;
     return true;
 }
 
 bool BasicTimer::set_timeout_callback(const CallBack &callback) {
-    std::scoped_lock lk(m_api_mutex, m_timing_thread_mutex);
+    std::scoped_lock lk(m_api_mutex);
+    std::scoped_lock lk2(m_state_mutex);
 
-    if (m_timing_thread_running.load()) {
-        std::cout << "BasicTimer::set_timeout_callback(): error: can't set callback when timer is running!\n";
+    if (m_state == Started) {
+        std::cerr << "can't set callback when timer is running!\n";;
         return false;
     }
 
@@ -138,10 +137,11 @@ bool BasicTimer::set_timeout_callback(const CallBack &callback) {
 }
 
 bool BasicTimer::set_timing_start_callback(const CallBack &callback) {
-    std::scoped_lock lk(m_api_mutex, m_timing_thread_mutex);
+    std::scoped_lock lk(m_api_mutex);
+    std::scoped_lock lk2(m_state_mutex);
 
-    if (m_timing_thread_running.load()) {
-        std::cout << "BasicTimer::set_timing_start_callback(): error: can't set callback when timer is running!\n";
+    if (m_state == Started) {
+        std::cerr << "can't set callback when timer is running!\n";;
         return false;
     }
 
@@ -150,10 +150,11 @@ bool BasicTimer::set_timing_start_callback(const CallBack &callback) {
 }
 
 bool BasicTimer::set_final_timeout_callback(const CallBack &callback) {
-    std::scoped_lock lk(m_api_mutex, m_timing_thread_mutex);
+    std::scoped_lock lk(m_api_mutex);
+    std::scoped_lock lk2(m_state_mutex);
 
-    if (m_timing_thread_running.load()) {
-        std::cout << "BasicTimer::set_final_timeout_callback(): error: can't set callback when timer is running!\n";
+    if (m_state == Started) {
+        std::cerr << "can't set callback when timer is running!\n";
         return false;
     }
 
@@ -161,71 +162,71 @@ bool BasicTimer::set_final_timeout_callback(const CallBack &callback) {
     return true;
 }
 
+void BasicTimer:: join(std::thread &t) {
+    if (!t.joinable()) {
+        std::cerr << "thread not joinable!!!\n";
+        return;
+    }
+
+    if (std::this_thread::get_id() != t.get_id()) {
+        t.join();
+    } else {
+        std::cerr << "thread can not join itself!!!\n";
+        return;
+    }
+}
+
 void BasicTimer::timing_thread() {
+    std::unique_lock lk(m_state_mutex);
+
     while (true) {
-        {
-            std::scoped_lock lk(m_timing_thread_mutex);
-            m_timing_thread_running.store(false);
+        m_timing_thread_cv.wait(lk, [this] { // internal unlocked
+            return m_state == Starting || m_destructing == true;
+        });
+
+        if (m_destructing == true) {
+            return;
         }
-        m_timing_thread_cv.notify_one(); {
-            std::unique_lock lk(m_timing_thread_mutex);
-            m_timing_thread_cv.wait(lk, [this] {
-                return m_timing_thread_request_start.load() || m_request_all_threads_exit.load();
-            });
 
-            if (m_request_all_threads_exit.load()) {
-                return;
-            }
+        m_state = Started;
+        m_api_cv.notify_one();
 
-            if (m_timing_thread_request_start.load()) {
-                m_timing_thread_request_start.store(false);
-            }
-
-            m_timing_thread_running.store(true);
-        }
-        m_timing_thread_cv.notify_one();
-
-        std::unique_lock lk(m_timing_thread_mutex);
-
-        for (std::uint32_t i = 0; i < m_loop_times.load(); i++) {
-            async_call_callback(m_timing_start_callback);
-
-            m_timing_thread_cv.wait_for(
-                lk, std::chrono::milliseconds(m_timeout_milliseconds.load()),
+        for (std::uint32_t i = 0; i < m_loop_times; i++) {
+            async_call(m_timing_start_callback);
+            
+            m_timing_thread_cv.wait_for( // internal unlocked
+                lk, std::chrono::milliseconds(m_timeout_milliseconds),
                 [this] {
-                    return m_timing_thread_request_stop.load() || m_request_all_threads_exit.load();
+                    return m_state == Stopping;
                 });
 
-            if (m_request_all_threads_exit.load()) {
-                return;
-            }
-
-            if (m_timing_thread_request_stop.load()) {
-                m_timing_thread_request_stop.store(false);
+            if (m_state == Stopping) {
                 break;
             }
 
-            async_call_callback(m_timeout_callback);
-
-            if (i == m_loop_times.load() - 1) {
-                async_call_callback(m_final_timeout_callback);
+            if (i == m_loop_times - 1) {
+                async_call(m_final_timeout_callback);
+            } else {
+                async_call(m_timeout_callback);
             }
         }
+
+        m_state = Stopped;
+        m_api_cv.notify_one();
     }
 }
 
 void BasicTimer::callback_thread() {
+    CallBack call_back;
     while (true) {
-        CallBack call_back; {
-            std::unique_lock lk(m_callback_thread_mutex);
+        {
+            std::unique_lock lk(m_callback_queue_mutex);
+            
+            m_callback_thread_cv.wait(lk, [this] { // internal unlocked
+                return !m_callback_queue.empty() || m_destructing == true;
+            });
 
-            if (m_callback_queue.empty()) {
-                m_callback_thread_cv.wait(lk, [this] {
-                    return m_request_all_threads_exit.load() || !m_callback_queue.empty();
-                });
-            }
-
-            if (m_request_all_threads_exit.load()) {
+            if (m_destructing == true) {
                 return;
             }
 
@@ -233,20 +234,24 @@ void BasicTimer::callback_thread() {
             m_callback_queue.pop();
         }
 
+        // internal unlocked below
         try {
-            call_back();
+            if (call_back) {
+                call_back();
+            }
         } catch (...) {
-            std::cout << "BasicTimer::callback_thread():error: callback throws an exception!" << std::endl;
+            std::cerr << "callback throws an exception!\n";
         }
     }
 }
 
-void BasicTimer::async_call_callback(const CallBack &callback) {
-    if (callback == nullptr) {
+void BasicTimer::async_call(const CallBack &callback) {
+    std::scoped_lock lk(m_callback_queue_mutex);
+
+    if (!callback) {
         return;
-    } {
-        std::scoped_lock lk(m_callback_thread_mutex);
-        m_callback_queue.push(callback);
     }
+
+    m_callback_queue.push(callback);
     m_callback_thread_cv.notify_one();
 }

@@ -7,75 +7,79 @@
 
 #include <queue>
 #include <mutex>
-#include <atomic>
 #include <thread>
 #include <functional>
 #include <condition_variable>
 
 /*
- * BasicTimer call callbacks in a dedicated thread sequentially to prevent timing thread from stuck or lag
- * The potential uncalled callbacks(previous callbacks run too slow) will still be called even if timer stopped automatically(finished looping)
- * The potential uncalled callbacks will not be called if timer stopped manually(by stop() method)
+ * BasicTimer calls callbacks in a dedicated thread sequentially to prevent the timing thread from getting stuck or lagging.
+ * The potential "not yet called callbacks" will not be called if stop() being called.
  */
 
 class BasicTimer {
-    using CallBack=std::function<void()>;
+    using CallBack = std::function<void()>;
+
+    enum TimingThreadState {
+        Starting,
+        Started,
+
+        Stopping,
+        Stopped,
+    };
 
 public:
     BasicTimer();
+    BasicTimer(BasicTimer&&) = delete;
+    BasicTimer(const BasicTimer&) = delete;
+
+    BasicTimer& operator=(BasicTimer&&) = delete;
+    BasicTimer& operator=(const BasicTimer&) = delete;
+
     ~BasicTimer();
 
-    // stop timer and drop all uncalled callbacks
     void stop();
-
     void start();
-
-    // whether timer is running(not be stopped automatically or manually)
     bool running();
 
-    // must be set when timer is not running(be stopped automatically or manually)
+    bool set_loop_times(std::uint32_t times);
     bool set_timeout(std::uint32_t milliseconds);
 
-    // must be set when timer is not running(be stopped automatically or manually)
-    bool set_loop_times(std::uint32_t times);
-
-    // be called at each timeout(including last timeout), must be set when timer is not running(be stopped automatically or manually)
+    // called at each timeout (excluding last timeout)
     bool set_timeout_callback(const CallBack &callback);
-
-    // be called at start of each timing loop, must be set when timer is not running(be stopped automatically or manually)
+    // called at start of each timing loop
     bool set_timing_start_callback(const CallBack &callback);
-
-    // be called at last timeout, must be set when timer is not running(be stopped automatically or manually)
+    // called at the last timeout
     bool set_final_timeout_callback(const CallBack &callback);
 
 private:
     void timing_thread();
     void callback_thread();
 
-    // add callback to queue and return
-    void async_call_callback(const CallBack &callback);
+    void stop_internal();
+    void join(std::thread &t);
+    void async_call(const CallBack &callback);
 
     std::mutex m_api_mutex;
+    std::mutex m_state_mutex;
+    std::mutex m_callback_queue_mutex;
 
-    std::atomic_uint m_loop_times{0};
-    std::atomic_uint m_timeout_milliseconds{0};
-    std::atomic_bool m_request_all_threads_exit {false};
+    std::thread m_timing_thread;
+    std::thread m_callback_thread;
 
-    CallBack  m_timeout_callback {nullptr};
-    CallBack  m_timing_start_callback {nullptr};
-    CallBack  m_final_timeout_callback {nullptr};
+    TimingThreadState m_state{Stopped};
+    bool m_destructing{false};
+    std::queue<CallBack> m_callback_queue;
 
-    std::queue <CallBack>   m_callback_queue;
-    std::thread             m_callback_thread;
-    std::condition_variable m_callback_thread_cv;
-    std::mutex              m_callback_thread_mutex;
-
-    std::thread             m_timing_thread;
+    std::condition_variable m_api_cv;
     std::condition_variable m_timing_thread_cv;
-    std::mutex              m_timing_thread_mutex;
-    std::atomic_bool        m_timing_thread_running {false};
-    std::atomic_bool        m_timing_thread_request_stop {false};
-    std::atomic_bool        m_timing_thread_request_start {false};
+    std::condition_variable m_callback_thread_cv;
+
+    std::uint32_t m_loop_times{0};
+    std::uint32_t m_timeout_milliseconds{0};
+
+    CallBack m_timeout_callback{nullptr};
+    CallBack m_timing_start_callback{nullptr};
+    CallBack m_final_timeout_callback{nullptr};
 };
 
 #endif //BASICTIMER_BASICTIMER_H
