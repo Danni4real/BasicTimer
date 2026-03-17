@@ -201,7 +201,7 @@ void BasicTimer::timing_thread() {
                 });
 
             if (m_state == Stopping) {
-                break;
+                goto NOTIFY_STOPPED;
             }
 
             if (i == m_loop_times - 1) {
@@ -211,6 +211,13 @@ void BasicTimer::timing_thread() {
             }
         }
 
+        m_timing_thread_cv.wait( // internal unlocked
+            lk,
+            [this] {
+                return m_state == Stopping;
+            });
+
+    NOTIFY_STOPPED:
         m_state = Stopped;
         m_api_cv.notify_one();
     }
